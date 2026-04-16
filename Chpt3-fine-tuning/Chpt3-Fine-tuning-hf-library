@@ -1,0 +1,55 @@
+import torch
+import numpy as np
+from torch.optim import AdamW
+from transformers import AutoTokenizer, DataCollatorWithPadding, TrainingArguments, Trainer, AutoModelForSequenceClassification
+from datasets import load_dataset
+import evaluate
+
+metric = evaluate.load("glue", "mrpc")
+raw_datasets = load_dataset("glue", "mrpc")
+# print(raw_datasets)
+
+# raw_train_dataset = raw_datasets["train"]
+# print(raw_train_dataset[0])
+# print(raw_train_dataset.features)
+'''This is for training pairs of sentences, so we have to tokenize both sentences together. 
+We can do this by passing both sentences to the tokenizer at the same time. 
+The tokenizer will then concatenate the two sentences together and add the appropriate special tokens.'''
+
+checkpoint = "bert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+
+def tokenize_function(example):
+    return tokenizer(example["sentence1"], example["sentence2"], truncation=True)
+
+tokenized_dataset = raw_datasets.map(tokenize_function, batched=True)
+print(tokenized_dataset)
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+def compute_metrics(eval_preds):
+    metric = evaluate.load("glue", "mrpc")
+    logits, labels = eval_preds
+    predictions = np.argmax(logits, axis=-1)
+    return metric.compute(predictions=predictions, references=labels)
+
+training_args = TrainingArguments(output_dir="test-trainer",
+                                 eval_strategy="epoch",
+                                 fp16=True, # mixed precision
+                                 learning_rate=2e-5,
+                                 gradient_accumulation_steps=16)
+
+model = AutoModelForSequenceClassification.from_pretrained(checkpoint, num_labels=2)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset["train"],
+    eval_dataset=tokenized_dataset["validation"],
+    data_collator=data_collator,
+    processing_class=tokenizer,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+

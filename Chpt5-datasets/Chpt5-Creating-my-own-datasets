@@ -1,0 +1,180 @@
+import requests
+from datasets import load_dataset
+
+url = "https://api.github.com/repos/huggingface/datasets/issues?page=1&per_page=1"
+response = requests.get(url)
+
+response.json()
+
+GITHUB_TOKEN = xxx  # Copy your GitHub token here
+headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+
+import time
+import math
+from pathlib import Path
+import pandas as pd
+from tqdm.notebook import tqdm
+
+
+def fetch_issues(
+    owner="huggingface",
+    repo="datasets",
+    num_issues=10_000,
+    rate_limit=5_000,
+    issues_path=Path("."),
+):
+    if not issues_path.is_dir():
+        issues_path.mkdir(exist_ok=True)
+
+    batch = []
+    all_issues = []
+    per_page = 100  # Number of issues to return per page
+    num_pages = math.ceil(num_issues / per_page)
+    base_url = "https://api.github.com/repos"
+
+    for page in tqdm(range(num_pages)):
+        # Query with state=all to get both open and closed issues
+        query = f"issues?page={page}&per_page={per_page}&state=all"
+        issues = requests.get(f"{base_url}/{owner}/{repo}/{query}", headers=headers)
+        batch.extend(issues.json())
+
+        if len(batch) > rate_limit and len(all_issues) < num_issues:
+            all_issues.extend(batch)
+            batch = []  # Flush batch for next time period
+            print(f"Reached GitHub rate limit. Sleeping for one hour ...")
+            time.sleep(60 * 60 + 1)
+
+    all_issues.extend(batch)
+    df = pd.DataFrame.from_records(all_issues)
+    df.to_json(f"{issues_path}/{repo}-issues.jsonl", orient="records", lines=True)
+    print(
+        f"Downloaded all the issues for {repo}! Dataset stored at {issues_path}/{repo}-issues.jsonl"
+    )
+
+# Depending on your internet connection, this can take several minutes to run...
+fetch_issues()
+
+issues_dataset = load_dataset("json", data_files="datasets-issues.jsonl", split="train")
+# this dataset contains both pull requests and issues
+
+issues_dataset = issues_dataset.map(
+    lambda x: {"is_pull_request": False if x["pull_request"] is None else True}
+) # create a pull_request field
+
+# There are comments related to a single issue
+def get_comments(issue_number):
+    url = f"https://api.github.com/repos/huggingface/datasets/issues/{issue_number}/comments"
+    response = requests.get(url, headers=headers)
+    return [r["body"] for r in response.json()]
+
+# Depending on your internet connection, this can take a few minutes...
+issues_with_comments_dataset = issues_dataset.map(
+    lambda x: {"comments": get_comments(x["number"])}
+)
+
+# Upload your dataset to the hugging face hub
+from huggingface_hub import notebook_login
+
+notebook_login()
+
+issues_with_comments_dataset.push_to_hub("github-issues")
+
+'''Semantic search with FAISS'''
+issues_dataset = load_dataset("lewtun/github-issues", split="train")
+
+issues_dataset = issues_dataset.filter(
+    lambda x: (x["is_pull_request"] == False and len(x["comments"]) > 0)
+)
+
+columns = issues_dataset.column_names
+columns_to_keep = ["title", "body", "html_url", "comments"]
+columns_to_remove = set(columns_to_keep).symmetric_difference(columns)
+issues_dataset = issues_dataset.remove_columns(columns_to_remove)
+# remove irrespective columns
+
+issues_dataset.set_format("pandas") # use pandas to explode the comments column, since it contains several comments
+df = issues_dataset[:]
+
+comments_df = df.explode("comments", ignore_index=True)
+
+from datasets import Dataset
+
+comments_dataset = Dataset.from_pandas(comments_df)
+
+# create a new field of comment length
+comments_dataset = comments_dataset.map(
+    lambda x: {"comment_length": len(x["comments"].split())}
+)
+
+# filter out short comments
+comments_dataset = comments_dataset.filter(lambda x: x["comment_length"] > 15)
+
+# concat the issue title, description, and comments in a new text column
+def concatenate_text(examples):
+    return {
+        "text": examples["title"]
+        + " \n "
+        + examples["body"]
+        + " \n "
+        + examples["comments"]
+    }
+
+
+comments_dataset = comments_dataset.map(concatenate_text)
+
+'''We are then ready to create semantic embeddings!!!'''
+
+from transformers import AutoTokenizer, AutoModel
+
+model_ckpt = "sentence-transformers/multi-qa-mpnet-base-dot-v1"
+tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+model = AutoModel.from_pretrained(model_ckpt)
+
+import torch
+
+device = torch.device("cuda")
+model.to(device)
+
+def cls_pooling(model_output):
+    return model_output.last_hidden_state[:, 0] # we only need the CLS token
+
+# tokenize a list of documents, place the tensors on the GPU, 
+# feed them to the model, and finally apply CLS pooling to the outputs:
+def get_embeddings(text_list):
+    encoded_input = tokenizer(
+        text_list, padding=True, truncation=True, return_tensors="pt"
+    )
+    encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+    model_output = model(**encoded_input)
+    return cls_pooling(model_output)
+
+embeddings_dataset = comments_dataset.map(
+    lambda x: {"embeddings": get_embeddings(x["text"]).detach().cpu().numpy()[0]}
+)
+
+'''Use FAISS for efficient similarity search'''
+# FAISS (short for Facebook AI Similarity Search) 
+# is a library that provides efficient algorithms to quickly search and cluster embedding vectors.
+embeddings_dataset.add_faiss_index(column="embeddings")
+
+question = "How can I load a dataset offline?"
+question_embedding = get_embeddings([question]).cpu().detach().numpy()
+# find the nearest example
+scores, samples = embeddings_dataset.get_nearest_examples(
+    "embeddings", question_embedding, k=5
+) # fast nearest neighbor search using FAISS index
+
+import pandas as pd
+
+samples_df = pd.DataFrame.from_dict(samples)
+samples_df["scores"] = scores
+samples_df.sort_values("scores", ascending=False, inplace=True)
+
+# iterate over the first few rows to see how well our query matched the available comments:
+for _, row in samples_df.iterrows():
+    print(f"COMMENT: {row.comments}")
+    print(f"SCORE: {row.scores}")
+    print(f"TITLE: {row.title}")
+    print(f"URL: {row.html_url}")
+    print("=" * 50)
+    print()

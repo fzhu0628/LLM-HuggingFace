@@ -1,0 +1,34 @@
+from transformers import AutoTokenizer
+
+'''Normalization is the process of standardizing text by applying transformations such as lowercasing, removing accents, and handling punctuation. 
+This helps to reduce the variability in the text and allows the model to focus on the core meaning of the words.'''
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+print(type(tokenizer.backend_tokenizer))
+
+print(tokenizer.backend_tokenizer.normalizer.normalize_str("Héllò hôw are ü?"))
+# This helps remove accents and lowercase the text, which is important for languages like English where capitalization and accents don't change the meaning of the word.
+
+'''Pre-tokenization is the process of splitting text into smaller units, 
+such as words or subwords, before the actual tokenization step.'''
+
+print(tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str("Hello, how are  you?"))
+
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+print(tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str("Hello, how are  you?"))
+
+tokenizer = AutoTokenizer.from_pretrained("t5-small")
+print(tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str("Hello, how are  you?"))
+
+# SentencePiece considers the text as a sequence of unicode characters, and replaces spaces with a special char _
+# it doesn't even require a pre-tokenizer, since it can handle the text as a sequence of characters.
+# Very useful for languages such as Chinese
+# Another feature is reversible tokenization: decoding the tokens is done simply by removing the _s with sapces
+
+"""
+| Model         | BPE                                                                                      | WordPiece                                                                                                                         | Unigram                                                                                       |
+|---------------|-----------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| Training      | Starts from a small vocabulary and learns rules to merge tokens                         | Starts from a small vocabulary and learns rules to merge tokens                                                                  | Starts from a large vocabulary and learns rules to remove tokens                               |
+| Training step | Merges the tokens corresponding to the most common pair                                 | Merges the tokens corresponding to the pair with the best score based on the frequency of the pair, privileging pairs where each individual token is less frequent | Removes all the tokens in the vocabulary that will minimize the loss computed on the whole corpus |
+| Learns        | Merge rules and a vocabulary                                                            | Just a vocabulary                                                                                                                | A vocabulary with a score for each token                                                       |
+| Encoding      | Splits a word into characters and applies the merges learned during training            | Finds the longest subword starting from the beginning that is in the vocabulary, then does the same for the rest of the word      | Finds the most likely split into tokens, using the scores learned during training              |
+"""
